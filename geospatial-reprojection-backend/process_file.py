@@ -1,233 +1,117 @@
-# import sys
-# import os  # Added import for os
-# import pandas as pd
-# import geopandas as gpd
-# from shapely import wkt
-# from shapely.ops import transform
-# from shapely.geometry import MultiLineString
-# from pyproj import Transformer
-# from tempfile import NamedTemporaryFile
+"""Transform explicitly named WGS84 lat/lon columns into EPSG:2263 coordinates.
 
-# def reproject_coordinates(file_path):
-#     print(f"Processing file: {file_path}")
+CSV and XLSX are supported. Other geometry and file types require a separate
+GIS format-aware workflow and are intentionally rejected here.
+"""
+import argparse
+import csv
+import math
+from pathlib import Path
 
-#     df = None
-#     output_file = None
-#     try:
-#         # Check the file extension and read the file accordingly
-#         if file_path.endswith('.xlsx'):
-#             df = pd.read_excel(file_path)
-#             output_suffix = '.xlsx'
-#             print("File is an Excel file.")
-#         elif file_path.endswith('.csv'):
-#             try:
-#                 df = pd.read_csv(file_path, low_memory=False)
-#                 output_suffix = '.csv'
-#                 print("File is a CSV file.")
-#                 print("Columns in the file:", df.columns)
-#             except Exception as e:
-#                 print(f"Error reading CSV file: {e}")
-#                 with open(file_path, 'r') as f:
-#                     print("First few lines of the CSV file:")
-#                     for _ in range(5):
-#                         print(f.readline().strip())
-#                 raise
-#         elif file_path.endswith('.geojson'):
-#             gdf = gpd.read_file(file_path)
-#             df = pd.DataFrame(gdf)
-#             output_suffix = '.geojson'
-#             print("File is a GeoJSON file.")
-#             print("Columns in the file:", df.columns)
-#         else:
-#             print("File format not supported.")
-#             raise ValueError("Unsupported file format")
-
-#         # Detect columns with coordinates
-#         geometry_column = None
-#         for column in df.columns:
-#             if 'geom' in column.lower() or 'wkt' in column.lower():
-#                 geometry_column = column
-#                 break
-
-#         if geometry_column:
-#             df['geometry'] = df[geometry_column].apply(wkt.loads)
-#             print(f"Geometry column detected: '{geometry_column}'")
-#         else:
-#             print("No recognizable geometry column found")
-#             raise ValueError("No recognizable geometry column found")
-
-#         # Create GeoDataFrame
-#         gdf = gpd.GeoDataFrame(df, geometry='geometry')
-
-#         # Define the transformer (modify the EPSG codes as needed)
-#         transformer = Transformer.from_crs("epsg:4326", "epsg:2263", always_xy=True)  # Change 4326 to your input CRS and 2263 to NY State Plane
-
-#         # Reproject the coordinates
-#         gdf['updated_geometry'] = gdf['geometry'].apply(lambda geom: transform_geometry(transformer, geom))
-
-#         # Extract latitude and longitude from the updated geometry
-#         def extract_lat_long(geom):
-#             if isinstance(geom, MultiLineString):
-#                 # Use the centroid for MultiLineString
-#                 centroid = geom.centroid
-#                 return centroid.y, centroid.x
-#             return geom.y, geom.x
-
-#         gdf['updated_lat'], gdf['updated_long'] = zip(*gdf['updated_geometry'].apply(extract_lat_long))
-
-#         # Drop the intermediate geometry columns
-#         gdf.drop(columns=['geometry', 'updated_geometry'], inplace=True)
-
-#         # Save the updated dataframe to a new file with the same format as the input file
-#         with NamedTemporaryFile(delete=False, suffix=output_suffix, dir=os.path.dirname(file_path)) as temp_file:
-#             if output_suffix == '.xlsx':
-#                 gdf.to_excel(temp_file.name, index=False)
-#             elif output_suffix == '.csv':
-#                 gdf.to_csv(temp_file.name, index=False)
-#             elif output_suffix == '.geojson':
-#                 gdf.to_file(temp_file.name, driver='GeoJSON')
-#             output_file = temp_file.name
-#             print(f"Output file: {output_file}")
-#             return output_file
-#     except Exception as e:
-#         print(f"Error: {e}")
-#         if df is not None:
-#             print(f"DataFrame content: {df.head()}")
-#         raise
-
-# def transform_geometry(transformer, geom):
-#     if geom.is_empty:
-#         return geom
-#     return transform(transformer.transform, geom)
-
-# if __name__ == "__main__":
-#     input_file = sys.argv[1]
-#     print(f"Input file: {input_file}")
-#     output_file = reproject_coordinates(input_file)
-#     print(f"Output file: {output_file}")
-
-
-import sys
-import os  # Added import for os
-import pandas as pd
-import geopandas as gpd
-from shapely import wkt
-from shapely.ops import transform
-from shapely.geometry import MultiLineString, Point
 from pyproj import Transformer
-from tempfile import NamedTemporaryFile
-from sklearn.preprocessing import StandardScaler
 
-def is_lat_lon_column(column_values):
-    """Heuristic to determine if a column is latitude or longitude."""
-    scaler = StandardScaler()
-    scaled_values = scaler.fit_transform(column_values.values.reshape(-1, 1))
-    return all(-1.5 <= v <= 1.5 for v in scaled_values.flatten())
+LAT_NAMES = {"latitude", "lat"}
+LON_NAMES = {"longitude", "lon", "long"}
+X_COL = "x_epsg2263_ft"
+Y_COL = "y_epsg2263_ft"
+TRANSFORM = Transformer.from_crs("EPSG:4326", "EPSG:2263", always_xy=True)
 
-def reproject_coordinates(file_path):
-    print(f"Processing file: {file_path}")
 
-    df = None
-    output_file = None
+class CoordinateError(ValueError):
+    pass
+
+
+def columns_for(headers):
+    if not headers or len(headers) != len(set(headers)):
+        raise CoordinateError("Missing or duplicate column headers.")
+    normalized = {str(name).strip().casefold(): name for name in headers if name is not None}
+    latitude = next((normalized[name] for name in ("latitude", "lat") if name in normalized), None)
+    longitude = next((normalized[name] for name in ("longitude", "lon", "long") if name in normalized), None)
+    if latitude is None or longitude is None:
+        raise CoordinateError("Expected latitude/longitude or lat/lon columns.")
+    if X_COL in headers or Y_COL in headers:
+        raise CoordinateError("Output coordinate columns already exist.")
+    return latitude, longitude
+
+
+def project(latitude, longitude, line):
     try:
-        # Check the file extension and read the file accordingly
-        if file_path.endswith('.xlsx'):
-            df = pd.read_excel(file_path)
-            output_suffix = '.xlsx'
-            print("File is an Excel file.")
-        elif file_path.endswith('.csv'):
-            try:
-                df = pd.read_csv(file_path, low_memory=False)
-                output_suffix = '.csv'
-                print("File is a CSV file.")
-                print("Columns in the file:", df.columns)
-            except Exception as e:
-                print(f"Error reading CSV file: {e}")
-                with open(file_path, 'r') as f:
-                    print("First few lines of the CSV file:")
-                    for _ in range(5):
-                        print(f.readline().strip())
-                raise
-        elif file_path.endswith('.geojson'):
-            gdf = gpd.read_file(file_path)
-            df = pd.DataFrame(gdf)
-            output_suffix = '.geojson'
-            print("File is a GeoJSON file.")
-            print("Columns in the file:", df.columns)
-        else:
-            print("File format not supported.")
-            raise ValueError("Unsupported file format")
+        lat = float(latitude)
+        lon = float(longitude)
+    except (TypeError, ValueError) as exc:
+        raise CoordinateError(f"Row {line}: latitude/longitude must be numeric.") from exc
+    if not math.isfinite(lat) or not math.isfinite(lon) or not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise CoordinateError(f"Row {line}: coordinates are out of range.")
+    x, y = TRANSFORM.transform(lon, lat)
+    if not math.isfinite(x) or not math.isfinite(y):
+        raise CoordinateError(f"Row {line}: coordinate transformation failed.")
+    return round(x, 3), round(y, 3)
 
-        # Detect columns with coordinates
-        geometry_column = None
-        lat_column = None
-        lon_column = None
 
-        for column in df.columns:
-            if 'geom' in column.lower() or 'wkt' in column.lower():
-                geometry_column = column
-                break
-            elif is_lat_lon_column(df[column]) and all(-90 <= v <= 90 for v in df[column]):
-                lat_column = column
-            elif is_lat_lon_column(df[column]) and all(-180 <= v <= 180 for v in df[column]):
-                lon_column = column
+def convert_csv(source, destination):
+    with source.open("r", encoding="utf-8-sig", newline="") as stream:
+        reader = csv.DictReader(stream)
+        headers = reader.fieldnames or []
+        lat_key, lon_key = columns_for(headers)
+        with destination.open("w", encoding="utf-8", newline="") as out:
+            writer = csv.DictWriter(out, fieldnames=[*headers, X_COL, Y_COL])
+            writer.writeheader()
+            rows = 0
+            for rows, record in enumerate(reader, start=1):
+                if None in record:  # extra columns beyond the original header
+                    raise CoordinateError(f"Row {rows + 1}: extra fields found.")
+                x, y = project(record.get(lat_key), record.get(lon_key), rows + 1)
+                writer.writerow({**record, X_COL: x, Y_COL: y})
+            if rows == 0:
+                raise CoordinateError("The input file contains no coordinate rows.")
 
-        if geometry_column:
-            df['geometry'] = df[geometry_column].apply(wkt.loads)
-            print(f"Geometry column detected: '{geometry_column}'")
-        elif lat_column and lon_column:
-            df['geometry'] = df.apply(lambda row: Point(row[lon_column], row[lat_column]), axis=1)
-            print(f"Latitude and Longitude columns detected: '{lat_column}', '{lon_column}'")
-        else:
-            print("No recognizable geometry or latitude/longitude columns found")
-            raise ValueError("No recognizable geometry or latitude/longitude columns found")
 
-        # Create GeoDataFrame
-        gdf = gpd.GeoDataFrame(df, geometry='geometry')
+def convert_xlsx(source, destination):
+    from openpyxl import load_workbook
+    book = load_workbook(source)
+    sheet = book.active
+    headers = [cell.value for cell in sheet[1]]
+    lat_key, lon_key = columns_for(headers)
+    lat_index, lon_index = headers.index(lat_key) + 1, headers.index(lon_key) + 1
+    x_index, y_index = len(headers) + 1, len(headers) + 2
+    sheet.cell(1, x_index, X_COL)
+    sheet.cell(1, y_index, Y_COL)
+    if sheet.max_row < 2:
+        raise CoordinateError("The workbook has no coordinate rows.")
+    for row_index in range(2, sheet.max_row + 1):
+        x, y = project(
+            sheet.cell(row_index, lat_index).value,
+            sheet.cell(row_index, lon_index).value, row_index
+        )
+        sheet.cell(row_index, x_index, x)
+        sheet.cell(row_index, y_index, y)
+    book.save(destination)
 
-        # Define the transformer (modify the EPSG codes as needed)
-        transformer = Transformer.from_crs("epsg:4326", "epsg:2263", always_xy=True)  # Change 4326 to your input CRS and 2263 to NY State Plane
 
-        # Reproject the coordinates
-        gdf['updated_geometry'] = gdf['geometry'].apply(lambda geom: transform_geometry(transformer, geom))
+def reproject_coordinates(input_path, output_path):
+    source, destination = Path(input_path), Path(output_path)
+    if source.resolve() == destination.resolve():
+        raise CoordinateError("Input and output paths must be different.")
+    suffix = source.suffix.lower()
+    if suffix not in {".csv", ".xlsx"} or destination.suffix.lower() != suffix:
+        raise CoordinateError("Only matching CSV and XLSX input/output pairs are supported.")
+    if suffix == ".csv":
+        convert_csv(source, destination)
+    else:
+        convert_xlsx(source, destination)
+    return destination
 
-        # Extract latitude and longitude from the updated geometry
-        def extract_lat_long(geom):
-            if isinstance(geom, MultiLineString):
-                # Use the centroid for MultiLineString
-                centroid = geom.centroid
-                return centroid.y, centroid.x
-            return geom.y, geom.x
 
-        gdf['updated_lat'], gdf['updated_long'] = zip(*gdf['updated_geometry'].apply(extract_lat_long))
+def main():
+    parser = argparse.ArgumentParser(description="Append EPSG:2263 projected coordinates")
+    parser.add_argument("input", type=Path)
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    try:
+        reproject_coordinates(args.input, args.output)
+    except (OSError, CoordinateError, ValueError) as exc:
+        parser.exit(2, f"Reprojection failed: {exc}\n")
 
-        # Drop the intermediate geometry columns
-        gdf.drop(columns=['geometry', 'updated_geometry'], inplace=True)
-
-        # Save the updated dataframe to a new file with the same format as the input file
-        with NamedTemporaryFile(delete=False, suffix=output_suffix, dir=os.path.dirname(file_path)) as temp_file:
-            if output_suffix == '.xlsx':
-                gdf.to_excel(temp_file.name, index=False)
-            elif output_suffix == '.csv':
-                gdf.to_csv(temp_file.name, index=False)
-            elif output_suffix == '.geojson':
-                gdf.to_file(temp_file.name, driver='GeoJSON')
-            output_file = temp_file.name
-            print(f"Output file: {output_file}")
-            return output_file
-    except Exception as e:
-        print(f"Error: {e}")
-        if df is not None:
-            print(f"DataFrame content: {df.head()}")
-        raise
-
-def transform_geometry(transformer, geom):
-    if geom.is_empty:
-        return geom
-    return transform(transformer.transform, geom)
 
 if __name__ == "__main__":
-    input_file = sys.argv[1]
-    print(f"Input file: {input_file}")
-    output_file = reproject_coordinates(input_file)
-    print(f"Output file: {output_file}")
+    main()

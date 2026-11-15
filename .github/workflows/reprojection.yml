@@ -1,0 +1,38 @@
+name: Validate reprojection API and web UI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: geospatial-reprojection-backend/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Python dependencies
+        working-directory: geospatial-reprojection-backend
+        run: python -m pip install -r requirements.txt
+      - name: Run real reprojection checks
+        working-directory: geospatial-reprojection-backend
+        run: python -m unittest discover -s tests -v
+      - name: Install Express backend
+        working-directory: geospatial-reprojection-backend
+        run: npm ci
+      - name: Test real file upload and download
+        working-directory: geospatial-reprojection-backend
+        run: node --test tests/server.test.cjs
+      - name: Install web dependencies
+        working-directory: client
+        run: npm ci
+      - name: Build web UI
+        working-directory: client
+        run: npm run build
