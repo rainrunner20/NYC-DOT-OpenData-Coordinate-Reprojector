@@ -2,97 +2,106 @@ import React, { useState } from 'react';
 import './App.css';
 import nycDotLogo from './assets/nyc_dot_logo.png';
 
+const MAX_BYTES = 10 * 1024 * 1024;
+const supported = /\.(csv|xlsx)$/i;
+
 const App: React.FC = () => {
   const [file, setFile] = useState<File | null>(null);
-  const [uploadProgress, setUploadProgress] = useState<number>(0);
-  const [uploading, setUploading] = useState<boolean>(false);
-  const [uploadSuccess, setUploadSuccess] = useState<boolean>(false);
+  const [progress, setProgress] = useState(0);
+  const [uploading, setUploading] = useState(false);
+  const [success, setSuccess] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      setFile(e.target.files[0]);
+  const chooseFile = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const next = event.target.files?.[0] ?? null;
+    setFile(next);
+    setSuccess(false);
+    setError(null);
+    setProgress(0);
+    if (next && (!supported.test(next.name) || next.size > MAX_BYTES)) {
+      setError('Use a CSV or XLSX file no larger than 10 MB.');
     }
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!file) return;
-
-    const formData = new FormData();
-    formData.append('file', file);
-
+  const submit = (event: React.FormEvent) => {
+    event.preventDefault();
+    if (!file || uploading) return;
+    if (!supported.test(file.name) || file.size > MAX_BYTES) {
+      setError('Use a CSV or XLSX file no larger than 10 MB.');
+      return;
+    }
     setUploading(true);
-    setUploadProgress(0);
-    setUploadSuccess(false);
+    setError(null);
+    setSuccess(false);
+    setProgress(0);
 
+    const form = new FormData();
+    form.append('file', file);
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', 'http://localhost:3000/upload', true);
-
-    xhr.upload.onprogress = (event) => {
-      if (event.lengthComputable) {
-        const percentComplete = (event.loaded / event.total) * 100;
-        setUploadProgress(percentComplete);
-      }
-    };
-
-    xhr.onload = () => {
-      if (xhr.status === 200) {
-        const blob = new Blob([xhr.response], { type: 'application/octet-stream' });
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = file.name.replace(/(\.[\w\d_-]+)$/i, '_reprojected$1');
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setUploadSuccess(true);
-      } else {
-        alert('Error processing file');
-      }
-
-      setUploading(false);
-      setUploadProgress(100);
-    };
-
-    xhr.onerror = () => {
-      alert('Error processing file');
-      setUploading(false);
-    };
-
+    xhr.open('POST', import.meta.env.VITE_API_URL || 'http://localhost:3000/upload', true);
     xhr.responseType = 'blob';
-    xhr.send(formData);
+    xhr.timeout = 35000;
+
+    xhr.upload.onprogress = event => {
+      if (event.lengthComputable) setProgress(Math.round(100 * event.loaded / event.total));
+    };
+    xhr.onload = () => {
+      setUploading(false);
+      if (xhr.status !== 200 || !(xhr.response instanceof Blob)) {
+        setError('Reprojection failed. Check that the file has valid latitude and longitude columns.');
+        return;
+      }
+      const url = URL.createObjectURL(xhr.response);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = file.name.replace(/\.(csv|xlsx)$/i, '_reprojected.$1');
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setSuccess(true);
+      setProgress(100);
+    };
+    xhr.onerror = () => {
+      setUploading(false);
+      setError('Could not contact the local reprojection service.');
+    };
+    xhr.ontimeout = () => {
+      setUploading(false);
+      setError('The request timed out. Try a smaller file.');
+    };
+    xhr.send(form);
   };
 
   return (
     <div className="app">
       <nav className="navbar">
-        <img src={nycDotLogo} alt="NYC DOT Logo" className="logo" />
+        <img src={nycDotLogo} alt="NYC DOT inspired project logo" className="logo" />
         <h1>Geospatial Reprojection</h1>
       </nav>
       <main className="main">
         <section className="instructions">
-          <h2>Instructions</h2>
+          <h2>WGS84 to NYC State Plane</h2>
+          <p>Convert latitude/longitude in EPSG:4326 to EPSG:2263 projected coordinates.</p>
           <ol>
-            <li>Click on the "Choose File" button to select your geospatial data file (.xlsx, .doc, .geojson, or .csv).</li>
-            <li>Ensure your file contains columns named <b>latitude</b> and <b>longitude</b> with valid coordinates, or geometry data in WKT format.</li>
-            <li>Once you have selected the file, click on the "Upload" button to upload and process the file.</li>
-            <li>Wait for the file to be processed. The processed file with updated coordinates will be downloaded automatically.</li>
+            <li>Choose a CSV or XLSX file up to 10 MB.</li>
+            <li>Provide columns named latitude and longitude, or lat and lon.</li>
+            <li>Download your table with two new fields: x_epsg2263_ft and y_epsg2263_ft.</li>
+            <li>These values are projected X/Y in US survey feet, not degrees.</li>
           </ol>
         </section>
-        <form onSubmit={handleSubmit} className="upload-form">
-          <input type="file" onChange={handleFileChange} accept=".xlsx,.doc,.geojson,.csv" className="file-input" />
-          <button type="submit" className="upload-button">Upload</button>
+        <form onSubmit={submit} className="upload-form">
+          <label htmlFor="dataset">Choose coordinate file</label>
+          <input id="dataset" type="file" onChange={chooseFile} accept=".csv,.xlsx" className="file-input" />
+          <button type="submit" disabled={!file || uploading || Boolean(error)} className="upload-button">
+            {uploading ? 'Processing…' : 'Upload and reproject'}
+          </button>
         </form>
-        {uploading && (
-          <div className="progress-bar">
-            <div className="progress" style={{ width: `${uploadProgress}%` }}></div>
-          </div>
-        )}
-        {uploadSuccess && (
-          <div className="checkmark">
-            ✓
-          </div>
-        )}
+        {uploading && <div role="status" className="progress-bar">
+          <div className="progress" style={{ width: String(progress) + '%' }} />
+        </div>}
+        {error && <p role="alert" style={{ color: '#b91c1c' }}>{error}</p>}
+        {success && <p role="status" className="checkmark">✓ Reprojected file downloaded</p>}
       </main>
     </div>
   );
